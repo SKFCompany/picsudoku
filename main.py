@@ -7,6 +7,7 @@ import time
 
 from kivy.animation import Animation
 from kivy.clock import Clock, mainthread
+from kivy.core.image import Image as CoreImage
 from kivy.core.text import Label as CoreLabel
 from kivy.core.window import Window
 from kivy.graphics import (ClearBuffers, ClearColor, Color, Ellipse, Fbo, Line,
@@ -25,7 +26,6 @@ from kivy.uix.screenmanager import FadeTransition, Screen, ScreenManager
 from kivy.uix.scrollview import ScrollView
 from kivy.uix.widget import Widget
 from kivymd.app import MDApp
-from PIL import Image as PILImage
 
 from scenes2 import SCENES2
 from sudoku import Sudoku
@@ -284,14 +284,8 @@ _CAP = {"p": 18, "s": 60}
 
 
 def _file_tex(path, size):
-    img = PILImage.open(path).convert("RGB")
-    w, h = img.size
-    s = min(w, h)
-    x0, y0 = (w - s) // 2, (h - s) // 2
-    img = img.crop((x0, y0, x0 + s, y0 + s)).resize((size, size), PILImage.LANCZOS)
-    img = img.transpose(PILImage.FLIP_TOP_BOTTOM)
-    tex = Texture.create(size=(size, size), colorfmt="rgb")
-    tex.blit_buffer(img.tobytes(), colorfmt="rgb", bufferfmt="ubyte")
+    """Картинка из assets (квадратная, fetch_art.py делает 1024x1024). Pillow не нужен: грузит SDL2_image."""
+    tex = CoreImage(path).texture
     tex.mag_filter = tex.min_filter = "linear"
     return tex
 
