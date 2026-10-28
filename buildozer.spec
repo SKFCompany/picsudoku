@@ -8,9 +8,9 @@ version = 0.1
 
 # ВАЖНО: скопируй строки requirements / osx / hostpython3 / p4a из рабочего спека FlowDo или UmBala
 # (python3 и hostpython3 должны быть одной версии, kivymd==1.2.0).
-requirements = python3,kivy,kivymd==1.2.0,pillow
+# requirements: оставь ОДНУ строку (из рабочего спека FlowDo), обязательно с pillow и kivymd==1.2.0
+# requirements = python3,kivy,kivymd==1.2.0,pillow
 
-requirements = python3==3.14.2,kivy==2.3.1,kivymd==1.2.0,plyer,fpdf2,fonttools,defusedxml,openpyxl,et_xmlfile
 orientation = portrait
 fullscreen = 0
 android.archs = arm64-v8a
