@@ -1,5 +1,5 @@
 [app]
-title = Судоку-Галерея
+title = Цветные нонограммы
 package.name = picsudoku
 package.domain = org.picsudoku
 source.dir = .

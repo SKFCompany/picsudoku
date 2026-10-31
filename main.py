@@ -2,11 +2,9 @@ import colorsys
 import json
 import os
 import random
-import threading
-import time
 
 from kivy.animation import Animation
-from kivy.clock import Clock, mainthread
+from kivy.clock import Clock
 from kivy.core.image import Image as CoreImage
 from kivy.core.text import Label as CoreLabel
 from kivy.core.window import Window
@@ -19,16 +17,15 @@ from kivy.properties import NumericProperty
 from kivy.uix.anchorlayout import AnchorLayout
 from kivy.uix.behaviors import ButtonBehavior
 from kivy.uix.boxlayout import BoxLayout
-from kivy.uix.gridlayout import GridLayout
 from kivy.uix.label import Label
 from kivy.uix.modalview import ModalView
 from kivy.uix.screenmanager import FadeTransition, Screen, ScreenManager
 from kivy.uix.scrollview import ScrollView
+from kivy.uix.stencilview import StencilView
 from kivy.uix.widget import Widget
 from kivymd.app import MDApp
 
 from scenes2 import SCENES2
-from sudoku import Sudoku
 
 # ───────────────────────── палитра ─────────────────────────
 BG = (0.05, 0.06, 0.12, 1)
@@ -43,8 +40,7 @@ HL = (0.2, 0.25, 0.42, 1)
 SAME = (0.28, 0.38, 0.6, 1)
 SELC = (0.2, 0.55, 0.65, 1)
 
-DIFFS = [("Легко", 6, 1), ("Средне", 9, 0), ("Сложно", 9, 2)]  # название, размер, уровень
-MAX_MISTAKES = 3
+DIFFS = [("Малый", 15, 4), ("Средний", 25, 6), ("Большой", 35, 8), ("Огромный", 50, 10)]  # название, размер, число цветов (с фоном)
 
 # ───────────────────────── рисование картинок ─────────────────────────
 S = 1024
@@ -274,7 +270,11 @@ def scan_packs():
 PICS = [dict(id=i, title=t, cat=c, src=f, author="") for i, t, c, f in _BASE_PICS + SCENES2]
 _fp, _fs = scan_packs()
 PICS += _fp
-STICKERS = [dict(id="m%d" % k, src=sc_mandala(k)) for k in range(24)] + _fs
+PICS += [dict(id="m%d" % k, title="Мандала %d" % (k + 1), cat="Мандалы", src=sc_mandala(k), author="")
+         for k in range(24)]
+PICS += [dict(id=s["id"], title=os.path.splitext(os.path.basename(s["src"]))[0], cat="Стикеры",
+              src=s["src"], author="") for s in _fs]
+STICKERS = []
 PIC_BY_ID = {p["id"]: p for p in PICS}
 ST_BY_ID = {s["id"]: s for s in STICKERS}
 CATS = ["Все"] + list(dict.fromkeys(p["cat"] for p in PICS))
@@ -379,6 +379,7 @@ class PictureView(Widget):
         super().__init__(**kw)
         self.key, self.grid, self.unlocked = key, grid, set(unlocked)
         self.on_pick = on_pick
+        self.lock, self.pick_all, self.ghost = True, False, .2
         self._t0 = None
         self.bind(pos=self.draw, size=self.draw, fresh_a=self.draw)
 
@@ -393,7 +394,7 @@ class PictureView(Widget):
         with self.canvas:
             Color(*PANEL)
             Rectangle(pos=(x, y), size=(w, h))
-            Color(1, 1, 1, .2)
+            Color(1, 1, 1, self.ghost)
             Rectangle(texture=tex, pos=(x, y), size=(w, h))
             for i in range(n * n):
                 r, c = divmod(i, n)
@@ -401,7 +402,7 @@ class PictureView(Widget):
                 if i in self.unlocked:
                     Color(1, 1, 1, self.fresh_a if i == self.fresh else 1)
                     Rectangle(texture=get_region(self.key, n, i), pos=p, size=(ps, ps))
-                else:
+                elif self.lock:
                     Color(.03, .04, .09, .45)
                     Rectangle(pos=p, size=(ps, ps))
                     Color(1, 1, 1, .35)
@@ -429,322 +430,542 @@ class PictureView(Widget):
                 c = int((touch.x - self.x) // ps)
                 r = int((self.y + self.height - touch.y) // ps)
                 i = max(0, min(self.grid ** 2 - 1, r * self.grid + c))
-                if i not in self.unlocked:
+                if self.pick_all or i not in self.unlocked:
                     self._t0 = None
                     self.on_pick(i)
         self._t0 = None
         return super().on_touch_up(touch)
 
 
-# ───────────────────────── игра ─────────────────────────
-class Game:
-    def __init__(self, n, level):
-        self.n = n
-        self.sd = Sudoku(n)
-        self.br, self.bc = self.sd.br, self.sd.bc
-        self.puz, self.sol = self.sd.make(level)
-        self.g = self.puz[:]
-        self.given = [v != 0 for v in self.puz]
-        self.notes = [set() for _ in range(n * n)]
-        self.sel = -1
-        self.mist = 0
-        self.hints = 3
-        self.undo = []
-        self.notes_mode = False
-        self.done = False
-        self.lost = False
-        self.t0 = time.time()
+# ───────────────────────── цветная нонограмма ─────────────────────────
+PAPER = (.95, .94, .9)
+_PZ = {}
 
-    def box(self, i):
-        return self.sd.box(i)
 
-    def select(self, i):
-        self.sel = i
+def lum(c):
+    return .299 * c[0] + .587 * c[1] + .114 * c[2]
 
-    def _push(self, i):
-        self.undo.append((i, self.g[i], set(self.notes[i])))
 
-    def _clean_peers(self, i, d):
-        for p in self.sd.peers[i]:
-            self.notes[p].discard(d)
+def tcol(c, a=1.0):
+    return (1, 1, 1, a) if lum(c) < .55 else (.05, .05, .1, a)
 
-    def put(self, d):
-        i = self.sel
-        if i < 0 or self.given[i] or self.done:
-            return
-        if self.notes_mode:
-            if self.g[i]:
-                return
-            self._push(i)
-            if d in self.notes[i]:
-                self.notes[i].discard(d)
+
+class Puzzle:
+    """w x h, pal[i-1] — цвет i (0 = фон/пусто), grid — целевая картинка построчно."""
+
+    def __init__(self, w, h, pal, grid):
+        self.w, self.h, self.pal, self.grid = w, h, pal, grid
+        self.rows = [self.runs(grid[r * w:(r + 1) * w]) for r in range(h)]
+        self.cols = [self.runs(grid[c::w]) for c in range(w)]
+        self.total = sum(1 for v in grid if v)
+        self.per = [0] * (len(pal) + 1)
+        for v in grid:
+            if v:
+                self.per[v] += 1
+
+    @staticmethod
+    def runs(line):
+        out, prev, n = [], 0, 0
+        for v in line:
+            if v and v == prev:
+                n += 1
             else:
-                self.notes[i].add(d)
-            return
-        if self.g[i] == d:
-            return
-        self._push(i)
-        self.g[i] = d
-        self.notes[i] = set()
-        if d != self.sol[i]:
-            self.mist += 1
-            if self.mist >= MAX_MISTAKES:
-                self.done = self.lost = True
-        else:
-            self._clean_peers(i, d)
-            self.check()
+                if prev:
+                    out.append((prev, n))
+                prev, n = v, (1 if v else 0)
+        if prev:
+            out.append((prev, n))
+        return out or [(0, 0)]
 
-    def erase(self):
-        i = self.sel
-        if i < 0 or self.given[i] or self.done:
-            return
-        self._push(i)
-        self.g[i] = 0
-        self.notes[i] = set()
 
-    def back(self):
-        if self.undo and not self.done:
-            i, v, nt = self.undo.pop()
-            self.g[i], self.notes[i] = v, nt
-            self.sel = i
+def kmeans(pts, k, it=8):
+    order = sorted(range(len(pts)), key=lambda i: lum(pts[i]))
+    cen = [pts[order[int((j + .5) * len(pts) / k)]] for j in range(k)]
+    asg = [0] * len(pts)
+    for _ in range(it):
+        sums = [[0, 0, 0, 0] for _ in range(k)]
+        for i, p in enumerate(pts):
+            best, bd = 0, 9
+            for j, c in enumerate(cen):
+                d = (p[0] - c[0]) ** 2 + (p[1] - c[1]) ** 2 + (p[2] - c[2]) ** 2
+                if d < bd:
+                    best, bd = j, d
+            asg[i] = best
+            s = sums[best]
+            s[0] += p[0]
+            s[1] += p[1]
+            s[2] += p[2]
+            s[3] += 1
+        cen = [(s[0] / s[3], s[1] / s[3], s[2] / s[3]) if s[3] else cen[j] for j, s in enumerate(sums)]
+    return cen, asg
 
-    def hint(self):
-        if self.hints <= 0 or self.done:
-            return
-        i = self.sel
-        if i < 0 or self.given[i] or self.g[i] == self.sol[i]:
-            bad = [k for k in range(self.n ** 2) if self.g[k] != self.sol[k]]
-            if not bad:
-                return
-            i = bad[0]
-            self.sel = i
-        self._push(i)
-        self.g[i] = self.sol[i]
-        self.notes[i] = set()
-        self._clean_peers(i, self.sol[i])
-        self.hints -= 1
-        self.check()
 
-    def check(self):
-        if self.g == self.sol:
-            self.done = True
+def build_puzzle(key, size, ncol):
+    ck = (key, size, ncol)
+    if ck in _PZ:
+        return _PZ[ck]
+    tex = get_tex(key)
+    W, H = tex.size
+    pix = tex.pixels  # RGBA, начало внизу слева
+    pts = []
+    for r in range(size):
+        for c in range(size):
+            rs = gs = bs = 0
+            for sy in range(3):
+                for sx in range(3):
+                    x = min(W - 1, int((c + (sx + .5) / 3) * W / size))
+                    y = min(H - 1, H - 1 - int((r + (sy + .5) / 3) * H / size))
+                    i = (y * W + x) * 4
+                    rs += pix[i]
+                    gs += pix[i + 1]
+                    bs += pix[i + 2]
+            pts.append((rs / 2295.0, gs / 2295.0, bs / 2295.0))
+    cen, asg = kmeans(pts, ncol)
+    cnt = [0] * ncol
+    for a in asg:
+        cnt[a] += 1
+    bg = max(range(ncol), key=lambda j: cnt[j])
+    order = sorted((j for j in range(ncol) if j != bg and cnt[j] > 0), key=lambda j: -cnt[j])
+    remap = {bg: 0}
+    for n, j in enumerate(order, start=1):
+        remap[j] = n
+    pz = Puzzle(size, size, [cen[j] for j in order], [remap[a] for a in asg])
+    _PZ[ck] = pz
+    return pz
+
+
+class Picross:
+    def __init__(self, pz, cells=None):
+        self.pz = pz
+        n = pz.w * pz.h
+        self.cells = list(cells) if cells and len(cells) == n else [-1] * n
+        self.undo, self.redo = [], []
+        self.correct, self.wrong = 0, 0
+        self.left = pz.per[:]
+        for i, v in enumerate(self.cells):
+            self._count(i, v, 1)
+        self.sel, self.tool, self.show_err = 1, "pen", False
+        self.celebrated = self.done
 
     @property
-    def won(self):
-        return self.done and not self.lost
+    def done(self):
+        return self.correct == self.pz.total and self.wrong == 0
 
-    def placed(self, d):
-        return sum(1 for i in range(self.n ** 2) if self.g[i] == d and self.sol[i] == d)
+    def _count(self, i, v, sign):
+        if v > 0:
+            if v == self.pz.grid[i]:
+                self.correct += sign
+                self.left[v] -= sign
+            else:
+                self.wrong += sign
+
+    def set(self, i, v, rec):
+        old = self.cells[i]
+        if old == v:
+            return False
+        self._count(i, old, -1)
+        self.cells[i] = v
+        self._count(i, v, 1)
+        if rec is not None:
+            rec.append((i, old, v))
+        return True
+
+    def do_undo(self):
+        if self.undo:
+            batch = self.undo.pop()
+            for i, old, new in reversed(batch):
+                self.set(i, old, None)
+            self.redo.append(batch)
+
+    def do_redo(self):
+        if self.redo:
+            batch = self.redo.pop()
+            for i, old, new in batch:
+                self.set(i, new, None)
+            self.undo.append(batch)
+
+    def hint(self):
+        pz = self.pz
+        miss = [i for i, t in enumerate(pz.grid) if t and self.cells[i] != t]
+        rec = []
+        if miss:
+            i = random.choice(miss)
+            self.set(i, pz.grid[i], rec)
+        else:
+            for i, t in enumerate(pz.grid):
+                if not t and self.cells[i] > 0:
+                    self.set(i, -1, rec)
+        if rec:
+            self.undo.append(rec)
+            self.redo.clear()
+
+    def line_ok(self, idxs, clue):
+        line = [v if v > 0 else 0 for v in (self.cells[i] for i in idxs)]
+        return Puzzle.runs(line) == clue
+
+    def row_ok(self, r):
+        w = self.pz.w
+        return self.line_ok(range(r * w, (r + 1) * w), self.pz.rows[r])
+
+    def col_ok(self, c):
+        return self.line_ok(range(c, self.pz.w * self.pz.h, self.pz.w), self.pz.cols[c])
 
 
-class Board(Widget):
-    def __init__(self, game, **kw):
+class PicrossBoard(StencilView):
+    def __init__(self, g, **kw):
         super().__init__(**kw)
-        self.game = game
+        self.g = g
+        pz = g.pz
+        self.cell, self.sx, self.sy = dp(26), 0, 0
+        self.fitted = False
+        self.maxr = max(len(x) for x in pz.rows)
+        self.maxc = max(len(x) for x in pz.cols)
+        self.on_change = None
         self._cache = {}
-        self.on_select = None
-        self.bind(pos=self.redraw, size=self.redraw)
+        self._mode = None
+        self._moving = False
+        self._rec = None
+        self._last = (0, 0)
+        self.prev = Texture.create(size=(pz.w, pz.h), colorfmt="rgb")
+        self.prev.mag_filter = self.prev.min_filter = "nearest"
+        self._trig = Clock.create_trigger(self.redraw, -1)
+        self.bind(pos=self._trig, size=self._on_size)
+        self.update_preview()
 
-    def _tex(self, t, fs, col):
-        k = (t, fs, col)
-        if k not in self._cache:
-            l = CoreLabel(text=t, font_size=fs, color=col)
-            l.refresh()
-            self._cache[k] = l.texture
-        return self._cache[k]
+    def _on_size(self, *a):
+        if not self.fitted and self.width > 50 and self.height > 50:
+            self.fitted = True
+            pz = self.g.pz
+            fit = min(self.width / (pz.w + .8 * self.maxr), self.height / (pz.h + .8 * self.maxc))
+            self.cell = max(dp(20), min(dp(44), fit))
+        self._trig()
+
+    def request_redraw(self):
+        self._trig()
+
+    def _geo(self):
+        cell = self.cell
+        kc = cell * .8
+        CW = max(dp(44), self.maxr * kc)
+        CH = max(dp(44), self.maxc * kc)
+        return cell, kc, CW, CH, self.x + CW, self.top - CH, self.width - CW, self.height - CH
+
+    def _clamp(self):
+        cell, kc, CW, CH, gx0, gyt, vw, vh = self._geo()
+        pz = self.g.pz
+        self.sx = min(max(self.sx, 0), max(0, pz.w * cell - vw))
+        self.sy = min(max(self.sy, 0), max(0, pz.h * cell - vh))
+
+    def zoom(self, f):
+        old = self.cell
+        new = max(dp(14), min(dp(64), old * f))
+        if new == old:
+            return
+        vw, vh = self._geo()[6:8]
+        cx, cy = (self.sx + vw / 2) / old, (self.sy + vh / 2) / old
+        self.cell = new
+        self.sx, self.sy = cx * new - vw / 2, cy * new - vh / 2
+        self._cache.clear()
+        self._clamp()
+        self._trig()
+
+    def update_preview(self):
+        pz = self.g.pz
+        pal = [tuple(int(x * 255) for x in c) for c in pz.pal]
+        bgb = tuple(int(x * 255) for x in PAPER)
+        buf = bytearray()
+        for r in range(pz.h - 1, -1, -1):
+            for c in range(pz.w):
+                v = self.g.cells[r * pz.w + c]
+                buf += bytes(pal[v - 1] if v > 0 else bgb)
+        self.prev.blit_buffer(bytes(buf), colorfmt="rgb", bufferfmt="ubyte")
 
     def _text(self, t, fs, col, cx, cy):
-        tx = self._tex(t, max(8, int(fs)), col)
+        k = (t, int(fs), col)
+        tx = self._cache.get(k)
+        if tx is None:
+            l = CoreLabel(text=t, font_size=max(8, int(fs)), color=col)
+            l.refresh()
+            tx = self._cache[k] = l.texture
         w, h = tx.size
         Color(1, 1, 1, 1)
         Rectangle(texture=tx, pos=(cx - w / 2, cy - h / 2), size=(w, h))
 
-    def _geom(self):
-        s = min(self.width, self.height)
-        return self.x + (self.width - s) / 2, self.y + (self.height - s) / 2, s
-
     def redraw(self, *a):
-        g = self.game
-        n = g.n
-        ox, oy, s = self._geom()
-        cs = s / n
         self.canvas.clear()
+        if self.width < 10 or self.height < 10:
+            return
+        g, pz = self.g, self.g.pz
+        self._clamp()
+        cell, kc, CW, CH, gx0, gyt, vw, vh = self._geo()
+        sx, sy = self.sx, self.sy
+        c0, c1 = int(sx // cell), min(pz.w - 1, int((sx + vw) // cell))
+        r0, r1 = int(sy // cell), min(pz.h - 1, int((sy + vh) // cell))
+        xr = min(self.right, gx0 - sx + pz.w * cell)
+        yb = max(self.y, gyt + sy - pz.h * cell)
         with self.canvas:
+            Color(*BG)
+            Rectangle(pos=self.pos, size=self.size)
+            Color(*PAPER)
+            Rectangle(pos=(gx0, yb), size=(xr - gx0, gyt - yb))
+            for r in range(r0, r1 + 1):
+                for c in range(c0, c1 + 1):
+                    i = r * pz.w + c
+                    v = g.cells[i]
+                    x, y = gx0 - sx + c * cell, gyt + sy - (r + 1) * cell
+                    if v > 0:
+                        Color(*pz.pal[v - 1])
+                        Rectangle(pos=(x, y), size=(cell, cell))
+                        if g.show_err and v != pz.grid[i]:
+                            Color(1, .1, .1, .95)
+                            Line(points=[x + 3, y + 3, x + cell - 3, y + cell - 3], width=2)
+                            Line(points=[x + 3, y + cell - 3, x + cell - 3, y + 3], width=2)
+                    elif v == -2:
+                        Color(.4, .4, .45, 1)
+                        m = cell * .3
+                        Line(points=[x + m, y + m, x + cell - m, y + cell - m], width=1.3)
+                        Line(points=[x + m, y + cell - m, x + cell - m, y + m], width=1.3)
+            for c in range(c0, c1 + 2):
+                Color(0, 0, 0, .55 if c % 5 == 0 else .16)
+                x = gx0 - sx + c * cell
+                Line(points=[x, yb, x, gyt], width=1.5 if c % 5 == 0 else 1)
+            for r in range(r0, r1 + 2):
+                Color(0, 0, 0, .55 if r % 5 == 0 else .16)
+                y = gyt + sy - r * cell
+                Line(points=[gx0, y, xr, y], width=1.5 if r % 5 == 0 else 1)
             Color(*PANEL)
-            RoundedRectangle(pos=(ox - dp(4), oy - dp(4)), size=(s + dp(8), s + dp(8)), radius=[dp(14)])
-            if g.sel >= 0:
-                sr, sc = divmod(g.sel, n)
-                sv = g.g[g.sel]
-                for i in range(n * n):
-                    r, c = divmod(i, n)
-                    col = None
-                    if i == g.sel:
-                        col = SELC
-                    elif sv and g.g[i] == sv:
-                        col = SAME
-                    elif r == sr or c == sc or g.box(i) == g.box(g.sel):
-                        col = HL
-                    if col:
-                        Color(*col)
-                        Rectangle(pos=(ox + c * cs + 1, oy + s - (r + 1) * cs + 1), size=(cs - 2, cs - 2))
-            for k in range(1, n):
-                for vertical in (True, False):
-                    thick = (k % g.bc == 0) if vertical else (k % g.br == 0)
-                    Color(*((.65, .75, 1, .7) if thick else (1, 1, 1, .1)))
-                    w = 2.2 if thick else 1
-                    if vertical:
-                        Line(points=[ox + k * cs, oy, ox + k * cs, oy + s], width=w)
-                    else:
-                        Line(points=[ox, oy + k * cs, ox + s, oy + k * cs], width=w)
-            for i in range(n * n):
-                r, c = divmod(i, n)
-                v = g.g[i]
-                if v:
-                    col = TXT if g.given[i] else (RED if v != g.sol[i] else ACC)
-                    self._text(str(v), cs * .56, col, ox + (c + .5) * cs, oy + s - (r + .5) * cs)
-                elif g.notes[i]:
-                    for d in g.notes[i]:
-                        rr, cc = divmod(d - 1, g.bc)
-                        self._text(str(d), cs * .24, MUTED,
-                                   ox + c * cs + (cc + .5) * cs / g.bc,
-                                   oy + s - r * cs - (rr + .5) * cs / g.br)
+            Rectangle(pos=(self.x, gyt), size=(self.width, CH))
+            Rectangle(pos=(self.x, self.y), size=(CW, vh))
+            for c in range(c0, c1 + 1):
+                runs = pz.cols[c]
+                a = .3 if g.col_ok(c) else 1
+                x = gx0 - sx + c * cell
+                for i, (col, n) in enumerate(runs):
+                    y = gyt + (len(runs) - 1 - i) * kc
+                    cc = pz.pal[col - 1] if col else (.35, .37, .45)
+                    Color(*cc, a)
+                    Rectangle(pos=(x + 1, y + 1), size=(cell - 2, kc - 2))
+                    self._text(str(n), kc * .62, tcol(cc, a), x + cell / 2, y + kc / 2)
+            for r in range(r0, r1 + 1):
+                runs = pz.rows[r]
+                a = .3 if g.row_ok(r) else 1
+                y = gyt + sy - (r + 1) * cell
+                for i, (col, n) in enumerate(runs):
+                    x = gx0 - (len(runs) - i) * kc
+                    cc = pz.pal[col - 1] if col else (.35, .37, .45)
+                    Color(*cc, a)
+                    Rectangle(pos=(x + 1, y + 1), size=(kc - 2, cell - 2))
+                    self._text(str(n), kc * .62, tcol(cc, a), x + kc / 2, y + cell / 2)
+            Color(*PANEL)
+            Rectangle(pos=(self.x, gyt), size=(CW, CH))
+            s = min(CW, CH) - dp(6)
+            Color(1, 1, 1, 1)
+            Rectangle(texture=self.prev, pos=(self.x + (CW - s) / 2, gyt + (CH - s) / 2), size=(s, s))
+
+    def cell_at(self, x, y):
+        cell, kc, CW, CH, gx0, gyt, vw, vh = self._geo()
+        pz = self.g.pz
+        if x < gx0 or y > gyt or x > self.right or y < self.y:
+            return -1
+        c, r = int((x - gx0 + self.sx) // cell), int((gyt - y + self.sy) // cell)
+        return r * pz.w + c if 0 <= c < pz.w and 0 <= r < pz.h else -1
+
+    def _apply(self, i):
+        g, v, m = self.g, self.g.cells[i], self._mode
+        if m == "paint":
+            g.set(i, g.sel, self._rec)
+        elif m == "erase" and v == g.sel:
+            g.set(i, -1, self._rec)
+        elif m == "xon" and v == -1:
+            g.set(i, -2, self._rec)
+        elif m == "xoff" and v == -2:
+            g.set(i, -1, self._rec)
 
     def on_touch_down(self, touch):
-        if self.collide_point(*touch.pos):
-            ox, oy, s = self._geom()
-            n = self.game.n
-            cs = s / n
-            c = int((touch.x - ox) // cs)
-            r = int((oy + s - touch.y) // cs)
-            if 0 <= r < n and 0 <= c < n:
-                self.game.select(r * n + c)
-                if self.on_select:
-                    self.on_select()
-                return True
-        return super().on_touch_down(touch)
+        if not self.collide_point(*touch.pos):
+            return super().on_touch_down(touch)
+        g = self.g
+        touch.grab(self)
+        self._last = touch.pos
+        self._mode, self._rec = None, None
+        self._moving = g.tool == "move"
+        if self._moving:
+            return True
+        i = self.cell_at(*touch.pos)
+        if i >= 0:
+            v = g.cells[i]
+            if g.tool == "pen":
+                self._mode = "erase" if v == g.sel else "paint"
+            else:
+                self._mode = "xoff" if v == -2 else "xon"
+            self._rec = []
+            self._apply(i)
+            self._trig()
+        return True
+
+    def on_touch_move(self, touch):
+        if touch.grab_current is not self:
+            return False
+        if self._moving:
+            self.sx -= touch.dx
+            self.sy += touch.dy
+            self._clamp()
+            self._trig()
+        elif self._mode:
+            x0, y0 = self._last
+            x1, y1 = touch.pos
+            steps = max(1, int(max(abs(x1 - x0), abs(y1 - y0)) // (self.cell / 2)))
+            for s in range(1, steps + 1):
+                i = self.cell_at(x0 + (x1 - x0) * s / steps, y0 + (y1 - y0) * s / steps)
+                if i >= 0:
+                    self._apply(i)
+            self._last = touch.pos
+            self._trig()
+        return True
+
+    def on_touch_up(self, touch):
+        if touch.grab_current is not self:
+            return False
+        touch.ungrab(self)
+        if self._mode and self._rec:
+            self.g.undo.append(self._rec)
+            self.g.redo.clear()
+        self._mode, self._rec = None, None
+        if self.on_change:
+            self.on_change(True)
+        return True
+
+
+class Swatch(BoxLayout):
+    def __init__(self, color, on_tap, **kw):
+        super().__init__(padding=dp(3), **kw)
+        with self.canvas.before:
+            self._bc = Color(1, 1, 1, 0)
+            self._br = RoundedRectangle(radius=[dp(12)])
+        self.bind(pos=self._u, size=self._u)
+        self.btn = RBtn("", bg=(*color, 1), fg=tcol(color), radius=9, font_size=sp(14))
+        self.btn.bind(on_release=lambda *_: on_tap())
+        self.add_widget(self.btn)
+
+    def _u(self, *a):
+        self._br.pos, self._br.size = self.pos, self.size
+
+    def mark(self, sel):
+        self._bc.rgba = (1, 1, 1, 1 if sel else 0)
 
 
 class GameScreen(Screen):
-    def start(self, game, reward, title):
-        self.game, self.reward = game, reward
+    def start(self, g, pic, skey):
+        self.g, self.pic, self.skey = g, pic, skey
         self.clear_widgets()
-        root = BoxLayout(orientation="vertical", padding=dp(14), spacing=dp(10))
+        root = BoxLayout(orientation="vertical", padding=dp(8), spacing=dp(6))
         self.add_widget(root)
-        top = BoxLayout(size_hint_y=None, height=dp(46), spacing=dp(8))
-        top.add_widget(RBtn("<", size_hint_x=None, width=dp(46),
+        top = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(8))
+        top.add_widget(RBtn("<", size_hint_x=None, width=dp(44),
                             on_release=lambda *_: MDApp.get_running_app().go_home()))
-        top.add_widget(lab(title, 17, TXT, True, align="left"))
-        self.timer = lab("00:00", 17, GOLD, True)
-        self.timer.size_hint_x = None
-        self.timer.width = dp(70)
-        top.add_widget(self.timer)
+        top.add_widget(lab(pic["title"], 16, TXT, True, align="left"))
+        self.pct = lab("0%", 17, GOLD, True)
+        self.pct.size_hint_x = None
+        self.pct.width = dp(60)
+        top.add_widget(self.pct)
         root.add_widget(top)
-        self.board = Board(game, size_hint=(1, None))
-        self.board.bind(width=lambda w, v: setattr(w, "height", v))
-        self.board.on_select = self.refresh
+        self.board = PicrossBoard(g)
+        self.board.on_change = self.changed
         root.add_widget(self.board)
-        self.stats = lab("", 14, MUTED, h=26)
-        root.add_widget(self.stats)
-        acts = BoxLayout(size_hint_y=None, height=dp(48), spacing=dp(8))
-        self.btn_notes = RBtn("Заметки")
-        for name, cb in (("Отмена", self.do_undo), ("Стереть", self.do_erase),
-                         (None, self.do_notes), ("Подсказка", self.do_hint)):
-            b = self.btn_notes if name is None else RBtn(name)
+        pal = BoxLayout(size_hint_y=None, height=dp(54), spacing=dp(2))
+        self.sw = {}
+        for i, col in enumerate(g.pz.pal, start=1):
+            s = Swatch(col, lambda i=i: self.pick(i))
+            self.sw[i] = s
+            pal.add_widget(s)
+        root.add_widget(pal)
+        r1 = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(6))
+        self.tb = {}
+        for key, name in (("pen", "Кисть"), ("x", "Крестик"), ("move", "Рука")):
+            b = RBtn(name)
+            b.bind(on_release=lambda *_, k=key: self.set_tool(k))
+            self.tb[key] = b
+            r1.add_widget(b)
+        for name, cb in (("Отмена", self.do_undo), ("Повтор", self.do_redo)):
+            b = RBtn(name)
             b.bind(on_release=lambda *_, f=cb: f())
-            acts.add_widget(b)
-        root.add_widget(acts)
-        pad = BoxLayout(size_hint_y=None, height=dp(60), spacing=dp(5))
-        self.pad = {}
-        for d in range(1, game.n + 1):
-            b = RBtn(str(d), bg=PANEL, fg=ACC, font_size=sp(24), radius=10)
-            b.bind(on_release=lambda *_, k=d: self.digit(k))
-            self.pad[d] = b
-            pad.add_widget(b)
-        root.add_widget(pad)
-        root.add_widget(Widget())
-        self.refresh()
-        self._ev = Clock.schedule_interval(self.tick, 1)
+            r1.add_widget(b)
+        root.add_widget(r1)
+        r2 = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(6))
+        self.err_btn = RBtn("Ошибки")
+        for name, cb in (("  -  ", lambda: self.board.zoom(1 / 1.25)), ("  +  ", lambda: self.board.zoom(1.25)),
+                         ("Подсказка", self.do_hint), (None, self.do_err)):
+            b = self.err_btn if name is None else RBtn(name)
+            b.bind(on_release=lambda *_, f=cb: f())
+            r2.add_widget(b)
+        root.add_widget(r2)
+        self.changed(False)
 
-    def stop(self):
-        ev = getattr(self, "_ev", None)
-        if ev:
-            ev.cancel()
-            self._ev = None
+    def pick(self, i):
+        self.g.sel = i
+        if self.g.tool == "move":
+            self.g.tool = "pen"
+        self.changed(False)
 
-    def tick(self, dt):
-        if not self.game.done:
-            t = int(time.time() - self.game.t0)
-            self.timer.text = "%02d:%02d" % (t // 60, t % 60)
-
-    def digit(self, d):
-        self.game.put(d)
-        self.after()
+    def set_tool(self, k):
+        self.g.tool = k
+        self.changed(False)
 
     def do_undo(self):
-        self.game.back()
-        self.after()
+        self.g.do_undo()
+        self.changed(True)
 
-    def do_erase(self):
-        self.game.erase()
-        self.after()
+    def do_redo(self):
+        self.g.do_redo()
+        self.changed(True)
 
     def do_hint(self):
-        self.game.hint()
-        self.after()
+        self.g.hint()
+        self.changed(True)
 
-    def do_notes(self):
-        self.game.notes_mode = not self.game.notes_mode
-        self.refresh()
+    def do_err(self):
+        self.g.show_err = not self.g.show_err
+        self.changed(False)
 
-    def after(self):
-        self.refresh()
-        g = self.game
-        if g.done:
-            self.stop()
-            if g.won:
-                MDApp.get_running_app().on_win(self.reward, int(time.time() - g.t0))
-            else:
-                MDApp.get_running_app().on_lose()
-
-    def refresh(self):
-        g = self.game
-        self.board.redraw()
-        self.stats.text = "Ошибки: %d/%d      Подсказки: %d" % (g.mist, MAX_MISTAKES, g.hints)
-        self.btn_notes.set_bg(SELC if g.notes_mode else PANEL2)
-        self.btn_notes.text = "Заметки: вкл" if g.notes_mode else "Заметки"
-        for d, b in self.pad.items():
-            full = g.placed(d) >= g.n
-            b.opacity = .3 if full else 1
-            b.disabled = full
+    def changed(self, final=True):
+        g = self.g
+        self.pct.text = "%d%%" % (100 * g.correct // max(1, g.pz.total))
+        for i, s in self.sw.items():
+            s.btn.text = str(g.left[i]) if g.left[i] > 0 else ""
+            s.btn.opacity = 1 if g.left[i] > 0 else .4
+            s.mark(i == g.sel)
+        for k, b in self.tb.items():
+            b.set_bg(SELC if g.tool == k else PANEL2)
+        self.err_btn.set_bg(SELC if g.show_err else PANEL2)
+        self.board.update_preview()
+        self.board.request_redraw()
+        if final:
+            app = MDApp.get_running_app()
+            app.save_progress(self.skey, g)
+            if g.done and not g.celebrated:
+                g.celebrated = True
+                app.on_win(self.pic)
 
 
 class HomeScreen(Screen):
-    PAGE_P, PAGE_S = 6, 12
+    PAGE = 6
 
     def __init__(self, **kw):
         super().__init__(**kw)
-        self.tab, self.cat, self.page = "p", "Все", 0
+        self.cat, self.page = "Все", 0
         root = BoxLayout(orientation="vertical", padding=dp(14), spacing=dp(8))
         self.add_widget(root)
-        root.add_widget(lab("Судоку-Галерея", 26, GOLD, True, h=44))
+        root.add_widget(lab("Цветные нонограммы", 26, GOLD, True, h=44))
         self.sub = lab("", 14, MUTED, h=22)
         root.add_widget(self.sub)
-        drow = BoxLayout(size_hint_y=None, height=dp(42), spacing=dp(8))
+        drow = BoxLayout(size_hint_y=None, height=dp(42), spacing=dp(6))
         self.dbtn = []
-        for i, (name, _, _) in enumerate(DIFFS):
-            b = RBtn(name)
+        for i, (name, n, _) in enumerate(DIFFS):
+            b = RBtn("%s\n%dx%d" % (name, n, n), font_size=sp(13))
             b.bind(on_release=lambda *_, k=i: self.set_diff(k))
             self.dbtn.append(b)
             drow.add_widget(b)
         root.add_widget(drow)
-        trow = BoxLayout(size_hint_y=None, height=dp(46), spacing=dp(8))
-        self.tbtn = {}
-        for k, name in (("p", "Картины"), ("s", "Стикеры")):
-            b = RBtn(name, font_size=sp(17))
-            b.bind(on_release=lambda *_, t=k: self.set_tab(t))
-            self.tbtn[k] = b
-            trow.add_widget(b)
-        root.add_widget(trow)
         self.chips_sv = ScrollView(size_hint_y=None, height=dp(44), do_scroll_y=False)
         self.chips = BoxLayout(size_hint_x=None, spacing=dp(8))
         self.chips.bind(minimum_width=self.chips.setter("width"))
@@ -759,16 +980,12 @@ class HomeScreen(Screen):
         app.save()
         self.refresh()
 
-    def set_tab(self, t):
-        self.tab, self.page = t, 0
-        self.refresh()
-
     def set_cat(self, c):
         self.cat, self.page = c, 0
         self.refresh()
 
-    def go_page(self, delta):
-        self.page += delta
+    def go_page(self, d):
+        self.page += d
         self.refresh()
 
     def _nav(self, pages):
@@ -785,64 +1002,42 @@ class HomeScreen(Screen):
     def refresh(self):
         app = MDApp.get_running_app()
         d = app.data
+        di = d["diff"]
         for i, b in enumerate(self.dbtn):
-            b.set_bg(SELC if i == d["diff"] else PANEL2)
-        for k, b in self.tbtn.items():
-            b.set_bg(SELC if k == self.tab else PANEL2)
-        total = sum(len(d["pieces"].get(p["id"], [])) for p in PICS)
-        self.sub.text = "Частей: %d/%d    Стикеров: %d/%d" % (
-            total, len(PICS) * 9, sum(1 for s in STICKERS if s["id"] in d["stickers"]), len(STICKERS))
-        show = self.tab == "p"
-        self.chips_sv.height = dp(44) if show else 0
-        self.chips_sv.opacity = 1 if show else 0
+            b.set_bg(SELC if i == di else PANEL2)
+        done = sum(1 for p in PICS if d["saves"].get("%s|%d" % (p["id"], di), {}).get("done"))
+        self.sub.text = "Собрано картин: %d из %d" % (done, len(PICS))
         self.chips.clear_widgets()
-        if show:
-            for c in CATS:
-                self.chips.add_widget(RBtn(c, bg=SELC if c == self.cat else PANEL2, size_hint_x=None,
-                                           width=dp(30) + dp(10) * len(c),
-                                           on_release=lambda *_, c=c: self.set_cat(c)))
+        for c in CATS:
+            self.chips.add_widget(RBtn(c, bg=SELC if c == self.cat else PANEL2, size_hint_x=None,
+                                       width=dp(30) + dp(10) * len(c),
+                                       on_release=lambda *_, c=c: self.set_cat(c)))
         self.scroll.clear_widgets()
         box = BoxLayout(orientation="vertical", size_hint_y=None, spacing=dp(14), padding=[0, dp(6), 0, dp(20)])
         box.bind(minimum_height=box.setter("height"))
-        if show:
-            items = [p for p in PICS if self.cat == "Все" or p["cat"] == self.cat]
-            pages = max(1, -(-len(items) // self.PAGE_P))
-            self.page = min(self.page, pages - 1)
-            _, n, lvl = DIFFS[d["diff"]]
-            for p in items[self.page * self.PAGE_P:(self.page + 1) * self.PAGE_P]:
-                have = d["pieces"].get(p["id"], [])
-                card = BoxLayout(orientation="vertical", size_hint_y=None, spacing=dp(4))
-                card.bind(minimum_height=card.setter("height"))
-                card.add_widget(lab("%s   %d/9" % (p["title"], len(have)), 17, TXT, True, h=28, align="left"))
-                if p["author"]:
-                    card.add_widget(lab(p["author"][:70], 12, MUTED, h=18, align="left"))
-                pv = PictureView(("p", p["id"]), 3, have, size_hint=(1, None),
-                                 on_pick=lambda i, p=p: app.begin(("p", p["id"], i), n, lvl,
-                                                                  "%s · часть %d" % (p["title"], i + 1)))
-                pv.bind(width=lambda w, v: setattr(w, "height", v))
-                card.add_widget(pv)
-                box.add_widget(card)
-        else:
-            pages = max(1, -(-len(STICKERS) // self.PAGE_S))
-            self.page = min(self.page, pages - 1)
-            grid = GridLayout(cols=3, size_hint_y=None, spacing=dp(10))
-            grid.bind(minimum_height=grid.setter("height"))
-            for gi in range(self.page * self.PAGE_S, min(len(STICKERS), (self.page + 1) * self.PAGE_S)):
-                s = STICKERS[gi]
-                n, lvl = (4, 0) if gi < 4 else ((6, 0) if gi < 10 else (6, 1))
-                pv = PictureView(("s", s["id"]), 1, [0] if s["id"] in d["stickers"] else [],
-                                 size_hint_y=None,
-                                 on_pick=lambda i, s=s, n=n, lvl=lvl, gi=gi: app.begin(
-                                     ("s", s["id"]), n, lvl, "Стикер %d" % (gi + 1)))
-                pv.bind(width=lambda w, v: setattr(w, "height", v))
-                grid.add_widget(pv)
-            box.add_widget(grid)
+        items = [p for p in PICS if self.cat == "Все" or p["cat"] == self.cat]
+        pages = max(1, -(-len(items) // self.PAGE))
+        self.page = min(self.page, pages - 1)
+        for p in items[self.page * self.PAGE:(self.page + 1) * self.PAGE]:
+            sv = d["saves"].get("%s|%d" % (p["id"], di), {})
+            status = "готово" if sv.get("done") else ("%d%%" % sv["pct"] if sv.get("pct") else "")
+            card = BoxLayout(orientation="vertical", size_hint_y=None, spacing=dp(4))
+            card.bind(minimum_height=card.setter("height"))
+            card.add_widget(lab("%s   %s" % (p["title"], status), 17, TXT, True, h=28, align="left"))
+            if p["author"]:
+                card.add_widget(lab(p["author"][:70], 12, MUTED, h=18, align="left"))
+            pv = PictureView(("p", p["id"]), 1, [0] if sv.get("done") else [], size_hint=(1, None),
+                             on_pick=lambda i, p=p: app.open_puzzle(p))
+            pv.lock, pv.pick_all, pv.ghost = False, True, .55
+            pv.bind(width=lambda w, v: setattr(w, "height", v))
+            card.add_widget(pv)
+            box.add_widget(card)
         if pages > 1:
             box.add_widget(self._nav(pages))
         self.scroll.add_widget(box)
 
 
-class PicSudokuApp(MDApp):
+class PicrossApp(MDApp):
     def build(self):
         self.theme_cls.theme_style = "Dark"
         Window.clearcolor = BG
@@ -856,12 +1051,11 @@ class PicSudokuApp(MDApp):
         Clock.schedule_once(lambda dt: self.home.refresh(), 0)
         return self.sm
 
-    # --- сохранение ---
     def _path(self):
         return os.path.join(self.user_data_dir, "save.json")
 
     def load(self):
-        d = {"pieces": {}, "stickers": [], "diff": 0}
+        d = {"saves": {}, "diff": 0}
         try:
             with open(self._path(), encoding="utf-8") as f:
                 d.update(json.load(f))
@@ -876,7 +1070,11 @@ class PicSudokuApp(MDApp):
         except Exception:
             pass
 
-    # --- навигация ---
+    def save_progress(self, skey, g):
+        self.data["saves"][skey] = {"cells": g.cells, "done": g.done,
+                                    "pct": 100 * g.correct // max(1, g.pz.total)}
+        self.save()
+
     def on_key(self, win, key, *a):
         if key == 27 and self.sm.current == "game":
             self.go_home()
@@ -884,77 +1082,44 @@ class PicSudokuApp(MDApp):
         return False
 
     def go_home(self):
-        self.gs.stop()
         self.sm.current = "home"
         self.home.refresh()
 
-    def begin(self, reward, n, level, title):
-        busy = ModalView(size_hint=(.7, None), height=dp(90), auto_dismiss=False,
-                         background_color=(0, 0, 0, .6))
-        busy.add_widget(lab("Создаю головоломку…", 18))
+    def open_puzzle(self, p):
+        di = self.data["diff"]
+        _, size, ncol = DIFFS[di]
+        skey = "%s|%d" % (p["id"], di)
+        busy = ModalView(size_hint=(.7, None), height=dp(90), auto_dismiss=False, background_color=(0, 0, 0, .6))
+        busy.add_widget(lab("Готовлю головоломку…", 18))
         busy.open()
 
-        def work():
-            g = Game(n, level)
-            self._launch(busy, g, reward, title)
+        def go(dt):
+            pz = build_puzzle(("p", p["id"]), size, ncol)
+            g = Picross(pz, self.data["saves"].get(skey, {}).get("cells"))
+            busy.dismiss()
+            self.gs.start(g, p, skey)
+            self.sm.current = "game"
 
-        threading.Thread(target=work, daemon=True).start()
+        Clock.schedule_once(go, .2)
 
-    @mainthread
-    def _launch(self, busy, g, reward, title):
-        busy.dismiss()
-        self.gs.start(g, reward, title)
-        self.sm.current = "game"
-
-    # --- итоги ---
-    def _overlay(self, head, key, grid, unlocked, fresh, btn_text, cb):
+    def on_win(self, pic):
         mv = ModalView(size_hint=(.94, None), height=dp(150) + min(Window.width * .86, Window.height * .5),
                        auto_dismiss=False, background_color=(0, 0, 0, .75))
         box = BoxLayout(orientation="vertical", padding=dp(14), spacing=dp(10))
-        box.add_widget(lab(head, 22, GOLD, True, h=40))
+        box.add_widget(lab("Картина собрана!", 22, GOLD, True, h=40))
         side = min(Window.width * .86, Window.height * .5)
         anchor = AnchorLayout()
-        pv = PictureView(key, grid, unlocked, size_hint=(None, None), size=(side, side))
+        pv = PictureView(("p", pic["id"]), 1, [0], size_hint=(None, None), size=(side, side))
         anchor.add_widget(pv)
         box.add_widget(anchor)
-        b = RBtn(btn_text, bg=SELC, size_hint_y=None, height=dp(52), font_size=sp(18))
-        b.bind(on_release=lambda *_: (mv.dismiss(), cb()))
-        box.add_widget(b)
-        mv.add_widget(box)
-        mv.open()
-        if fresh >= 0:
-            pv.fresh, pv.fresh_a = fresh, 0
-            Animation(fresh_a=1, d=1.5, t="out_quad").start(pv)
-
-    def on_win(self, reward, secs):
-        if reward[0] == "p":
-            _, pi, piece = reward
-            lst = self.data["pieces"].setdefault(str(pi), [])
-            if piece not in lst:
-                lst.append(piece)
-            self.save()
-            full = len(lst) >= 9
-            head = "Картина собрана!" if full else "Открыта новая часть!"
-            self._overlay(head, ("p", pi), 3, lst, piece, "Дальше", self.go_home)
-        else:
-            si = reward[1]
-            if si not in self.data["stickers"]:
-                self.data["stickers"].append(si)
-            self.save()
-            self._overlay("Стикер получен!", ("s", si), 1, [0], 0, "Дальше", self.go_home)
-
-    def on_lose(self):
-        mv = ModalView(size_hint=(.85, None), height=dp(190), auto_dismiss=False,
-                       background_color=(0, 0, 0, .75))
-        box = BoxLayout(orientation="vertical", padding=dp(16), spacing=dp(12))
-        box.add_widget(lab("Слишком много ошибок", 20, RED, True, h=40))
-        box.add_widget(lab("Не страшно — попробуй ещё раз с новой сеткой.", 15, MUTED))
-        b = RBtn("К галерее", bg=SELC, size_hint_y=None, height=dp(50))
+        b = RBtn("Дальше", bg=SELC, size_hint_y=None, height=dp(52), font_size=sp(18))
         b.bind(on_release=lambda *_: (mv.dismiss(), self.go_home()))
         box.add_widget(b)
         mv.add_widget(box)
         mv.open()
+        pv.fresh, pv.fresh_a = 0, 0
+        Animation(fresh_a=1, d=1.6, t="out_quad").start(pv)
 
 
 if __name__ == "__main__":
-    PicSudokuApp().run()
+    PicrossApp().run()
