@@ -40,7 +40,8 @@ HL = (0.2, 0.25, 0.42, 1)
 SAME = (0.28, 0.38, 0.6, 1)
 SELC = (0.2, 0.55, 0.65, 1)
 
-DIFFS = [("Малый", 15, 4), ("Средний", 25, 6), ("Большой", 35, 8), ("Огромный", 50, 10)]  # название, размер, число цветов (с фоном)
+DIFFS = [("Лёгкий", 10, 4, 3), ("Средний", 15, 6, 3), ("Сложный", 20, 8, 3), ("Мастер", 25, 10, 4)]
+# название, клеток в стороне сектора, цветов (с фоном), секторов по стороне картины
 
 # ───────────────────────── рисование картинок ─────────────────────────
 S = 1024
@@ -280,7 +281,7 @@ ST_BY_ID = {s["id"]: s for s in STICKERS}
 CATS = ["Все"] + list(dict.fromkeys(p["cat"] for p in PICS))
 
 _TEX, _FBO, _REG = {}, {}, {}
-_CAP = {"p": 18, "s": 60}
+_CAP = {"p": 12, "s": 60}
 
 
 def _file_tex(path, size):
@@ -500,21 +501,24 @@ def kmeans(pts, k, it=8):
     return cen, asg
 
 
-def build_puzzle(key, size, ncol):
-    ck = (key, size, ncol)
+def build_puzzle(key, size, ncol, n=1, sector=0):
+    """Нонограмма size x size из сектора (sector) картины, поделённой на n x n секторов."""
+    ck = (key, size, ncol, n, sector)
     if ck in _PZ:
         return _PZ[ck]
     tex = get_tex(key)
     W, H = tex.size
     pix = tex.pixels  # RGBA, начало внизу слева
+    sr, sc = divmod(sector, n)
+    x0, y0, sw, sh = sc * W / n, sr * H / n, W / n, H / n  # y0 считается сверху
     pts = []
     for r in range(size):
         for c in range(size):
             rs = gs = bs = 0
             for sy in range(3):
                 for sx in range(3):
-                    x = min(W - 1, int((c + (sx + .5) / 3) * W / size))
-                    y = min(H - 1, H - 1 - int((r + (sy + .5) / 3) * H / size))
+                    x = min(W - 1, int(x0 + (c + (sx + .5) / 3) * sw / size))
+                    y = min(H - 1, H - 1 - int(y0 + (r + (sy + .5) / 3) * sh / size))
                     i = (y * W + x) * 4
                     rs += pix[i]
                     gs += pix[i + 1]
@@ -522,14 +526,14 @@ def build_puzzle(key, size, ncol):
             pts.append((rs / 2295.0, gs / 2295.0, bs / 2295.0))
     cen, asg = kmeans(pts, ncol)
     cnt = [0] * ncol
-    for a in asg:
-        cnt[a] += 1
+    for a_ in asg:
+        cnt[a_] += 1
     bg = max(range(ncol), key=lambda j: cnt[j])
     order = sorted((j for j in range(ncol) if j != bg and cnt[j] > 0), key=lambda j: -cnt[j])
     remap = {bg: 0}
-    for n, j in enumerate(order, start=1):
-        remap[j] = n
-    pz = Puzzle(size, size, [cen[j] for j in order], [remap[a] for a in asg])
+    for k, j in enumerate(order, start=1):
+        remap[j] = k
+    pz = Puzzle(size, size, [cen[j] for j in order], [remap[a_] for a_ in asg])
     _PZ[ck] = pz
     return pz
 
@@ -855,15 +859,15 @@ class Swatch(BoxLayout):
 
 
 class GameScreen(Screen):
-    def start(self, g, pic, skey):
-        self.g, self.pic, self.skey = g, pic, skey
+    def start(self, g, pic, skey, sector=0, n=1):
+        self.g, self.pic, self.skey, self.sector = g, pic, skey, sector
         self.clear_widgets()
         root = BoxLayout(orientation="vertical", padding=dp(8), spacing=dp(6))
         self.add_widget(root)
         top = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(8))
         top.add_widget(RBtn("<", size_hint_x=None, width=dp(44),
                             on_release=lambda *_: MDApp.get_running_app().go_home()))
-        top.add_widget(lab(pic["title"], 16, TXT, True, align="left"))
+        top.add_widget(lab("%s · часть %d/%d" % (pic["title"], sector + 1, n * n), 15, TXT, True, align="left"))
         self.pct = lab("0%", 17, GOLD, True)
         self.pct.size_hint_x = None
         self.pct.width = dp(60)
@@ -944,7 +948,7 @@ class GameScreen(Screen):
             app.save_progress(self.skey, g)
             if g.done and not g.celebrated:
                 g.celebrated = True
-                app.on_win(self.pic)
+                app.on_win(self.pic, self.sector)
 
 
 class HomeScreen(Screen):
@@ -960,8 +964,8 @@ class HomeScreen(Screen):
         root.add_widget(self.sub)
         drow = BoxLayout(size_hint_y=None, height=dp(42), spacing=dp(6))
         self.dbtn = []
-        for i, (name, n, _) in enumerate(DIFFS):
-            b = RBtn("%s\n%dx%d" % (name, n, n), font_size=sp(13))
+        for i, (name, n, _, k) in enumerate(DIFFS):
+            b = RBtn("%s\n%dx%d" % (name, n * k, n * k), font_size=sp(13))
             b.bind(on_release=lambda *_, k=i: self.set_diff(k))
             self.dbtn.append(b)
             drow.add_widget(b)
@@ -1005,8 +1009,9 @@ class HomeScreen(Screen):
         di = d["diff"]
         for i, b in enumerate(self.dbtn):
             b.set_bg(SELC if i == di else PANEL2)
-        done = sum(1 for p in PICS if d["saves"].get("%s|%d" % (p["id"], di), {}).get("done"))
-        self.sub.text = "Собрано картин: %d из %d" % (done, len(PICS))
+        k = DIFFS[di][3]
+        done = sum(1 for p in PICS if len(app.done_sectors(p["id"])) == k * k)
+        self.sub.text = "Собрано картин: %d из %d   (секторов в картине: %d)" % (done, len(PICS), k * k)
         self.chips.clear_widgets()
         for c in CATS:
             self.chips.add_widget(RBtn(c, bg=SELC if c == self.cat else PANEL2, size_hint_x=None,
@@ -1019,16 +1024,16 @@ class HomeScreen(Screen):
         pages = max(1, -(-len(items) // self.PAGE))
         self.page = min(self.page, pages - 1)
         for p in items[self.page * self.PAGE:(self.page + 1) * self.PAGE]:
-            sv = d["saves"].get("%s|%d" % (p["id"], di), {})
-            status = "готово" if sv.get("done") else ("%d%%" % sv["pct"] if sv.get("pct") else "")
+            ds = app.done_sectors(p["id"])
+            status = "собрана" if len(ds) == k * k else "%d/%d" % (len(ds), k * k)
             card = BoxLayout(orientation="vertical", size_hint_y=None, spacing=dp(4))
             card.bind(minimum_height=card.setter("height"))
             card.add_widget(lab("%s   %s" % (p["title"], status), 17, TXT, True, h=28, align="left"))
             if p["author"]:
                 card.add_widget(lab(p["author"][:70], 12, MUTED, h=18, align="left"))
-            pv = PictureView(("p", p["id"]), 1, [0] if sv.get("done") else [], size_hint=(1, None),
-                             on_pick=lambda i, p=p: app.open_puzzle(p))
-            pv.lock, pv.pick_all, pv.ghost = False, True, .55
+            pv = PictureView(("p", p["id"]), k, ds, size_hint=(1, None),
+                             on_pick=lambda i, p=p: app.open_puzzle(p, i))
+            pv.ghost = .35
             pv.bind(width=lambda w, v: setattr(w, "height", v))
             card.add_widget(pv)
             box.add_widget(card)
@@ -1085,39 +1090,48 @@ class PicrossApp(MDApp):
         self.sm.current = "home"
         self.home.refresh()
 
-    def open_puzzle(self, p):
+    def done_sectors(self, pid):
         di = self.data["diff"]
-        _, size, ncol = DIFFS[di]
-        skey = "%s|%d" % (p["id"], di)
+        k = DIFFS[di][3]
+        sv = self.data["saves"]
+        return [i for i in range(k * k) if sv.get("%s|%d|%d" % (pid, di, i), {}).get("done")]
+
+    def open_puzzle(self, p, sector):
+        di = self.data["diff"]
+        _, size, ncol, k = DIFFS[di]
+        skey = "%s|%d|%d" % (p["id"], di, sector)
         busy = ModalView(size_hint=(.7, None), height=dp(90), auto_dismiss=False, background_color=(0, 0, 0, .6))
         busy.add_widget(lab("Готовлю головоломку…", 18))
         busy.open()
 
         def go(dt):
-            pz = build_puzzle(("p", p["id"]), size, ncol)
+            pz = build_puzzle(("p", p["id"]), size, ncol, k, sector)
             g = Picross(pz, self.data["saves"].get(skey, {}).get("cells"))
             busy.dismiss()
-            self.gs.start(g, p, skey)
+            self.gs.start(g, p, skey, sector, k)
             self.sm.current = "game"
 
         Clock.schedule_once(go, .2)
 
-    def on_win(self, pic):
+    def on_win(self, pic, sector):
+        k = DIFFS[self.data["diff"]][3]
+        done = self.done_sectors(pic["id"])
+        full = len(done) >= k * k
         mv = ModalView(size_hint=(.94, None), height=dp(150) + min(Window.width * .86, Window.height * .5),
                        auto_dismiss=False, background_color=(0, 0, 0, .75))
         box = BoxLayout(orientation="vertical", padding=dp(14), spacing=dp(10))
-        box.add_widget(lab("Картина собрана!", 22, GOLD, True, h=40))
+        box.add_widget(lab("Картина собрана!" if full else "Открыта часть: %d из %d" % (len(done), k * k), 22, GOLD, True, h=40))
         side = min(Window.width * .86, Window.height * .5)
         anchor = AnchorLayout()
-        pv = PictureView(("p", pic["id"]), 1, [0], size_hint=(None, None), size=(side, side))
+        pv = PictureView(("p", pic["id"]), k, done, size_hint=(None, None), size=(side, side))
         anchor.add_widget(pv)
         box.add_widget(anchor)
-        b = RBtn("Дальше", bg=SELC, size_hint_y=None, height=dp(52), font_size=sp(18))
+        b = RBtn("К галерее" if full else "Дальше", bg=SELC, size_hint_y=None, height=dp(52), font_size=sp(18))
         b.bind(on_release=lambda *_: (mv.dismiss(), self.go_home()))
         box.add_widget(b)
         mv.add_widget(box)
         mv.open()
-        pv.fresh, pv.fresh_a = 0, 0
+        pv.fresh, pv.fresh_a = sector, 0
         Animation(fresh_a=1, d=1.6, t="out_quad").start(pv)
 
 
